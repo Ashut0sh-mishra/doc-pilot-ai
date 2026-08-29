@@ -1,0 +1,3 @@
+# OCR runs in Python 3.12 separately from the FastAPI Python 3.14 environment.
+paddleocr==3.7.0
+paddlepaddle==3.2.0

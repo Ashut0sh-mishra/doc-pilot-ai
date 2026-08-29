@@ -1,0 +1,1 @@
+"""PaddleOCR processing worker."""
