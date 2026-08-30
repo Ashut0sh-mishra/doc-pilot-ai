@@ -5,7 +5,7 @@ async function request(path, options = {}, role = 'patient') {
     ...options,
     headers: {
       'X-User-Role': role,
-      ...(options.body instanceof Blob ? {} : { 'Content-Type': 'application/json' }),
+      ...(options.body instanceof Blob || options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
       ...options.headers,
     },
   });
@@ -23,6 +23,18 @@ export const api = {
   records: (id) => request(`/v1/patients/${id}/records`),
   medications: (id) => request(`/v1/patients/${id}/medications`),
   summary: (id) => request(`/v1/patients/${id}/clinical-summary`, {}, 'doctor'),
+  getJob: (jobId) => request(`/v1/jobs/${jobId}`),
+  retryJob: (jobId, role = 'patient') => request(`/v1/jobs/${jobId}/retry`, { method: 'POST' }, role),
+  getOcr: (recordId) => request(`/v1/records/${recordId}/ocr`),
+  saveOcrCorrection: (recordId, payload, role = 'patient') =>
+    request(`/v1/records/${recordId}/ocr`, { method: 'PUT', body: JSON.stringify(payload) }, role),
+  async getRecordFileUrl(recordId, role = 'patient') {
+    // The file endpoint requires the role header, so fetch bytes and hand
+    // the UI a same-origin blob URL for preview.
+    const response = await fetch(`${API_URL}/v1/records/${recordId}/file`, { headers: { 'X-User-Role': role } });
+    if (!response.ok) throw new Error(`Document download failed (${response.status})`);
+    return URL.createObjectURL(await response.blob());
+  },
   async uploadRecord(patientId, file) {
     const initiated = await request(`/v1/patients/${patientId}/records/upload`, {
       method: 'POST',
