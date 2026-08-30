@@ -4,18 +4,39 @@ import {
   Activity, AlertCircle, ArrowLeft, ArrowRight, CalendarDays, Check,
   CheckCircle2, ChevronDown, CircleUserRound, ClipboardCheck, Clock3,
   FileImage, FilePlus2, FileText, HeartPulse, History, LayoutDashboard,
-  Menu, MessageSquareText, MoreHorizontal, Pill, Plus, Search, ShieldCheck,
+  Menu, MessageSquareText, MoreHorizontal, Pill, Plus, RefreshCw, Search, ShieldCheck,
   Sparkles, Stethoscope, UploadCloud, Users, X, XCircle
 } from 'lucide-react';
 import './styles.css';
 import { api } from './api';
 
-const recordsSeed = [
-  { id: 1, name: 'Cardiology consultation', date: '12 Aug 2026', type: 'Consultation', status: 'analysed', icon: FileText, tone: 'blue' },
-  { id: 2, name: 'Complete blood count', date: '09 Aug 2026', type: 'Lab report', status: 'analysed', icon: FileText, tone: 'violet' },
-  { id: 3, name: 'Medicine strip — Metformin', date: 'Uploaded today', type: 'Medicine photo', status: 'review', icon: FileImage, tone: 'orange' },
-  { id: 4, name: 'Chest X-ray', date: '18 May 2026', type: 'Imaging', status: 'analysed', icon: FileImage, tone: 'cyan' },
-];
+const STATUS_META = {
+  uploading:    { label: 'Uploading…',          className: 'st-active' },
+  uploaded:     { label: 'Uploaded',            className: 'st-active' },
+  processing:   { label: 'Processing document', className: 'st-active' },
+  ready:        { label: 'Ready',               className: 'st-ready' },
+  needs_review: { label: 'Needs review',        className: 'st-review' },
+  failed:       { label: 'Processing failed',   className: 'st-failed' },
+  local:        { label: 'Local only',          className: 'st-local' },
+};
+
+// Patient-safe messages keyed by the job's error_code. Technical details
+// stay server-side in the job error/logs; doctors can still see the code.
+const ERROR_MESSAGES = {
+  invalid_input: 'The uploaded file could not be read. Please try uploading it again.',
+  unsupported_format: 'This file type is not supported. Please use a PDF or a clear photo (JPG, PNG, WebP, TIFF).',
+  corrupt_document: 'The file appears to be damaged or incomplete. Try exporting or photographing it again.',
+  too_large: 'The document is too large to process. Please upload fewer pages or a smaller file.',
+  model_init_failure: 'The document reader is temporarily unavailable. Please retry in a little while.',
+  ocr_failure: 'We could not read the text in this document. A clearer, well-lit photo may help.',
+  timeout: 'Processing took too long and was stopped. Please try again.',
+  transient: 'Something went wrong while processing. Please try again.',
+};
+
+function StatusBadge({ status }) {
+  const meta = STATUS_META[status] || { label: status, className: 'st-local' };
+  return <span className={`status-badge ${meta.className}`}>{meta.label}</span>;
+}
 
 const timeline = [
   { date: 'Today', title: 'Pre-visit intake completed', body: 'Reports increased fatigue and ankle swelling over the last 3 weeks.', tag: 'Patient reported', tone: 'green' },
@@ -30,32 +51,46 @@ function App() {
   const [activeNav, setActiveNav] = useState('Patients');
   const [tab, setTab] = useState('Overview');
   const [search, setSearch] = useState('');
-  const [records, setRecords] = useState(recordsSeed);
+  const [records, setRecords] = useState([]);
   const [toast, setToast] = useState('');
   const [mobileNav, setMobileNav] = useState(false);
   const [apiStatus, setApiStatus] = useState('connecting');
   const [patientId, setPatientId] = useState(localStorage.getItem('docpilot_patient_id') || '');
+  const [patient, setPatient] = useState(null);
+  const [reviewRecord, setReviewRecord] = useState(null);
   const fileRef = useRef(null);
 
   const notify = (message) => { setToast(message); window.setTimeout(() => setToast(''), 2600); };
+
+  const refreshRecords = async (id = patientId) => {
+    if (!id) return;
+    const remote = await api.records(id);
+    const mapped = remote.map(toUiRecord);
+    setRecords(mapped);
+    // keep an open review drawer in sync with live job progress
+    setReviewRecord((open) => open ? mapped.find((r) => r.id === open.id) || open : open);
+  };
+
   useEffect(() => {
     let active = true;
     async function connect() {
       try {
         await api.health();
         let id = localStorage.getItem('docpilot_patient_id');
+        let info = null;
         if (id) {
-          try { await api.getPatient(id); } catch { id = null; }
+          try { info = await api.getPatient(id); } catch { id = null; }
         }
         if (!id) {
-          const patient = await api.createPatient({ full_name: 'Arun Kumar', date_of_birth: '1968-03-14', sex: 'male', phone: '+91 98765 43210', blood_group: 'B+' });
-          id = patient.id;
+          info = await api.createPatient({ full_name: 'Arun Kumar', date_of_birth: '1968-03-14', sex: 'male', phone: '+91 98765 43210', blood_group: 'B+' });
+          id = info.id;
           localStorage.setItem('docpilot_patient_id', id);
         }
         const remote = await api.records(id);
         if (!active) return;
         setPatientId(id);
-        if (remote.length) setRecords(remote.map(toUiRecord));
+        setPatient(info);
+        setRecords(remote.map(toUiRecord));
         setApiStatus('connected');
       } catch (error) {
         if (active) { setApiStatus('offline'); notify(`Backend unavailable: ${error.message}`); }
@@ -65,17 +100,27 @@ function App() {
     return () => { active = false; };
   }, []);
 
+  // Track processing: while any record is uploaded/processing, poll the
+  // records endpoint (each record carries its latest job) until terminal.
+  useEffect(() => {
+    if (!patientId) return undefined;
+    const pending = records.some(r => r.status === 'processing' || r.status === 'uploaded');
+    if (!pending) return undefined;
+    const timer = window.setInterval(() => { refreshRecords().catch(() => {}); }, 2500);
+    return () => window.clearInterval(timer);
+  }, [patientId, records]);
+
   const addFiles = async (files) => {
-    const additions = [...files].map((f, i) => ({ id: Date.now() + i, name: f.name, date: 'Uploaded just now', type: f.type.startsWith('image') ? 'Medicine / record photo' : 'Medical document', status: 'review', icon: f.type.startsWith('image') ? FileImage : FileText, tone: 'orange' }));
+    const additions = [...files].map((f, i) => ({ id: `local-${Date.now()}-${i}`, name: f.name, date: 'Uploading…', type: f.type.startsWith('image') ? 'Medicine / record photo' : 'Medical document', status: patientId ? 'uploading' : 'local', icon: f.type.startsWith('image') ? FileImage : FileText, tone: f.type.startsWith('image') ? 'orange' : 'blue' }));
     setRecords((r) => [...additions, ...r]);
     if (!patientId) { notify('Backend is not connected; showing files locally'); return; }
     try {
       await Promise.all([...files].map(file => api.uploadRecord(patientId, file)));
-      const remote = await api.records(patientId);
-      setRecords(remote.map(toUiRecord));
-      notify(`${additions.length} record${additions.length === 1 ? '' : 's'} uploaded and queued for processing`);
+      await refreshRecords();
+      notify(`${additions.length} record${additions.length === 1 ? '' : 's'} uploaded — OCR processing started`);
     } catch (error) {
       notify(`Upload failed: ${error.message}`);
+      await refreshRecords().catch(() => {});
     }
   };
 
@@ -104,7 +149,7 @@ function App() {
       <main>
         <header className="topbar">
           <button className="icon-btn menu-btn" onClick={() => setMobileNav(true)}><Menu size={21}/></button>
-          <div className="breadcrumbs"><button>{view === 'doctor' ? 'Patients' : 'My health'}</button><span>/</span><strong>{view === 'doctor' ? 'Arun Kumar' : 'My profile'}</strong></div>
+          <div className="breadcrumbs"><button>{view === 'doctor' ? 'Patients' : 'My health'}</button><span>/</span><strong>{view === 'doctor' ? (patient?.full_name || 'Patient') : 'My profile'}</strong></div>
           <div className="top-actions">
             <span className={`api-status ${apiStatus}`}><i/>{apiStatus === 'connected' ? 'API connected' : apiStatus === 'offline' ? 'API offline' : 'Connecting'}</span>
             <div className="mode-switch"><button className={view === 'patient' ? 'selected' : ''} onClick={() => setView('patient')}>Patient view</button><button className={view === 'doctor' ? 'selected' : ''} onClick={() => setView('doctor')}>Doctor view</button></div>
@@ -113,42 +158,53 @@ function App() {
         </header>
 
         {view === 'doctor' ? (
-          <DoctorView tab={tab} setTab={setTab} search={search} setSearch={setSearch} records={filtered} notify={notify} onUpload={() => fileRef.current?.click()} />
+          <DoctorView tab={tab} setTab={setTab} search={search} setSearch={setSearch} records={filtered} patient={patient} notify={notify} onUpload={() => fileRef.current?.click()} onOpenRecord={setReviewRecord} />
         ) : (
-          <PatientView records={records} onUpload={() => fileRef.current?.click()} notify={notify}/>
+          <PatientView records={records} patient={patient} onUpload={() => fileRef.current?.click()} notify={notify} onOpenRecord={setReviewRecord}/>
         )}
-        <input ref={fileRef} type="file" hidden multiple accept="image/*,.pdf,.doc,.docx" onChange={(e) => addFiles(e.target.files)} />
+        <input ref={fileRef} type="file" hidden multiple accept="image/*,.pdf" onChange={(e) => { addFiles(e.target.files); e.target.value = ''; }} />
       </main>
+      {reviewRecord && (
+        <OcrReview
+          record={reviewRecord}
+          role={view === 'doctor' ? 'doctor' : 'patient'}
+          reviewerName={view === 'doctor' ? 'Dr. Rhea Menon' : 'Arun Kumar'}
+          onClose={() => setReviewRecord(null)}
+          onChanged={() => refreshRecords().catch(() => {})}
+          notify={notify}
+        />
+      )}
       {toast && <div className="toast"><CheckCircle2 size={18}/>{toast}</div>}
     </div>
   );
 }
 
-function DoctorView({tab, setTab, search, setSearch, records, notify, onUpload}) {
+function DoctorView({tab, setTab, search, setSearch, records, patient, notify, onUpload, onOpenRecord}) {
+  const age = patient?.date_of_birth ? Math.floor((Date.now() - new Date(patient.date_of_birth)) / 3.15576e10) : null;
   return <div className="page">
     <div className="doctor-sticky-context">
       <section className="patient-head">
         <button className="back"><ArrowLeft size={18}/></button>
-        <div className="patient-avatar"><AvatarImage src="/assets/avatars/patient-arun.png" initials="AK" alt="Arun Kumar"/></div>
-        <div className="patient-title"><div><h1>Arun Kumar</h1><span className="status-pill"><span/> Ready for review</span></div><p>58 years · Male · Patient ID DP-2048 · Blood group B+</p></div>
+        <div className="patient-avatar"><AvatarImage src="/assets/avatars/patient-arun.png" initials="AK" alt={patient?.full_name || 'Patient'}/></div>
+        <div className="patient-title"><div><h1>{patient?.full_name || 'Patient'}</h1><span className="status-pill"><span/> Ready for review</span></div><p>{age != null ? `${age} years · ` : ''}{patient?.sex ? `${patient.sex[0].toUpperCase()}${patient.sex.slice(1)} · ` : ''}Patient ID {patient ? patient.id.slice(0, 8) : '—'}{patient?.blood_group ? ` · Blood group ${patient.blood_group}` : ''}</p></div>
         <div className="head-actions"><button className="btn secondary" onClick={onUpload}><UploadCloud size={17}/> Add records</button><button className="btn primary" onClick={() => notify('Consultation note started')}><Stethoscope size={17}/> Start consultation</button></div>
       </section>
 
-      <div className="warning-strip"><AlertCircle size={18}/><div><strong>2 important record gaps identified</strong><span>Latest ECG and renal function follow-up are not available.</span></div><button onClick={() => setTab('Record gaps')}>Review gaps <ArrowRight size={15}/></button></div>
+      <div className="warning-strip"><AlertCircle size={18}/><div><strong>2 important record gaps identified <span className="demo-pill">Demo data</span></strong><span>Latest ECG and renal function follow-up are not available.</span></div><button onClick={() => setTab('Record gaps')}>Review gaps <ArrowRight size={15}/></button></div>
 
       <div className="tabs">{['Overview','Timeline','All records','Record gaps'].map(t => <button key={t} className={tab===t?'active':''} onClick={() => setTab(t)}>{t}{t==='Record gaps'&&<b>2</b>}</button>)}</div>
     </div>
 
     {tab === 'Overview' && <Overview notify={notify}/>} 
-    {tab === 'Timeline' && <Timeline/>}
-    {tab === 'All records' && <Records records={records} search={search} setSearch={setSearch} onUpload={onUpload}/>} 
+    {tab === 'Timeline' && <div><span className="demo-pill">Demo data — not generated from this patient's records</span><Timeline/></div>}
+    {tab === 'All records' && <Records records={records} search={search} setSearch={setSearch} onUpload={onUpload} onOpenRecord={onOpenRecord}/>} 
     {tab === 'Record gaps' && <Gaps notify={notify}/>} 
   </div>
 }
 
 function Overview({notify}) { const [detail, setDetail] = useState(null); return <div className="doctor-cockpit">
   <section className="visit-hero card">
-    <div className="visit-meta"><div className="visit-label"><MessageSquareText size={17}/> REASON FOR VISIT</div><button onClick={() => notify('9 verified and 3 patient-provided sources')}><ShieldCheck size={15}/> Based on 12 records</button></div>
+    <div className="visit-meta"><div className="visit-label"><MessageSquareText size={17}/> REASON FOR VISIT <span className="demo-pill">Demo data</span></div><button onClick={() => notify('9 verified and 3 patient-provided sources')}><ShieldCheck size={15}/> Based on 12 records</button></div>
     <div className="visit-headline status-worsening"><h3>Progressive fatigue with swelling in both ankles</h3><span><Activity size={15}/> Worsening</span></div>
     <div className="symptom-facts"><span><Clock3 size={16}/><strong>Symptoms for 3 weeks</strong></span><span><Activity size={16}/><strong>Gradually worsening</strong></span><span><CalendarDays size={16}/><strong>Worse in the evening</strong></span></div>
     <blockquote className="patient-quote"><p>“I feel unusually tired and my shoes become tight by evening.”</p><cite>— Patient reported today</cite></blockquote>
@@ -220,17 +276,17 @@ function PriorityDetail({type}) {
   return <><span className="drawer-tag">{content.tag}</span><h2>{content.title}</h2><p className="drawer-lead">{content.lead}</p><div className="drawer-facts">{content.facts.map(([label,value])=><div key={label}><small>{label}</small><strong>{value}</strong></div>)}</div><div className="drawer-note"><Stethoscope size={18}/><p>{content.note}</p></div><button className="btn primary full">Add to consultation plan</button></>;
 }
 
-function PatientView({records,onUpload,notify}) { const [step,setStep]=useState(2); return <div className="patient-page">
-  <div className="intake-top"><div><span className="eyebrow">PRE-VISIT CHECK-IN</span><h1>Help your doctor understand your health</h1><p>Add what you have—even a photo of a medicine strip helps. You can skip anything you don’t know.</p></div><div className="appointment"><CalendarDays size={20}/><span><small>Appointment</small><strong>Today, 4:30 PM</strong><em>Dr. Rhea Menon</em></span></div></div>
+function PatientView({records,patient,onUpload,notify,onOpenRecord}) { const [step,setStep]=useState(2); return <div className="patient-page">
+  <div className="intake-top"><div><span className="eyebrow">PRE-VISIT CHECK-IN</span><h1>Help your doctor understand your health</h1><p>Add what you have—even a photo of a medicine strip helps. You can skip anything you don’t know.</p></div><div className="appointment"><CalendarDays size={20}/><span><small>Appointment <span className="demo-pill">Demo</span></small><strong>Today, 4:30 PM</strong><em>Dr. Rhea Menon</em></span></div></div>
   <div className="stepper">{['About you','Your records','Symptoms','Review'].map((s,i)=><button key={s} className={step===i+1?'active':step>i+1?'done':''} onClick={()=>setStep(i+1)}><span>{step>i+1?<Check size={15}/>:i+1}</span><label>{s}</label></button>)}</div>
-  {step===1 && <div className="intake-card card"><h2>Tell us about you</h2><p>This helps match records to the right person.</p><div className="form-grid"><Field label="Full name" value="Arun Kumar"/><Field label="Date of birth" value="14 March 1968"/><Field label="Phone number" value="+91 98765 43210"/><Field label="Blood group" value="B+"/></div><button className="btn primary next" onClick={()=>setStep(2)}>Continue <ArrowRight size={17}/></button></div>}
+  {step===1 && <div className="intake-card card"><h2>Tell us about you</h2><p>This helps match records to the right person.</p><div className="form-grid"><Field label="Full name" value={patient?.full_name || ''}/><Field label="Date of birth" value={patient?.date_of_birth || ''}/><Field label="Phone number" value={patient?.phone || ''}/><Field label="Blood group" value={patient?.blood_group || ''}/></div><button className="btn primary next" onClick={()=>setStep(2)}>Continue <ArrowRight size={17}/></button></div>}
   {step===2 && <div className="intake-card card"><div className="intake-heading"><div><h2>Add your medical records</h2><p>Upload prescriptions, test reports, scans, discharge summaries, or medicine photos.</p></div><span className="safe"><ShieldCheck size={16}/> Private & secure</span></div>
-    <button className="dropzone" onClick={onUpload}><div><UploadCloud size={29}/></div><strong>Choose files or take a photo</strong><span>PDF, JPG, PNG or DOC · Up to 20 MB each</span><em><FilePlus2 size={16}/> Add records</em></button>
+    <button className="dropzone" onClick={onUpload}><div><UploadCloud size={29}/></div><strong>Choose files or take a photo</strong><span>PDF or photo (JPG, PNG, WebP, TIFF) · Up to 20 MB each</span><em><FilePlus2 size={16}/> Add records</em></button>
     <div className="help-cards"><div><FileText size={20}/><span><strong>Have medical documents?</strong><small>Upload consultations, tests, scans or prescriptions.</small></span></div><div><Pill size={20}/><span><strong>Only have medicine strips?</strong><small>Take clear photos of the front and back.</small></span></div><div><AlertCircle size={20}/><span><strong>Something is missing?</strong><small>That’s okay. Tell us what you remember next.</small></span></div></div>
-    <h3 className="uploaded-title">Added records <span>{records.length}</span></h3><div className="upload-list">{records.slice(0,4).map(r=><div key={r.id}><span className={`file-icon ${r.tone}`}><r.icon size={18}/></span><span><strong>{r.name}</strong><small>{r.type} · {r.date}</small></span><span className={r.status==='analysed'?'analysed':'review'}>{r.status==='analysed'?<><CheckCircle2 size={14}/> Ready</>:<><Clock3 size={14}/> Reviewing</>}</span><button><X size={16}/></button></div>)}</div>
+    <h3 className="uploaded-title">Added records <span>{records.length}</span></h3><div className="upload-list">{records.slice(0,4).map(r=><button type="button" className="upload-row" key={r.id} onClick={()=>!String(r.id).startsWith('local-') && onOpenRecord(r)}><span className={`file-icon ${r.tone}`}><r.icon size={18}/></span><span><strong>{r.name}</strong><small>{r.type} · {r.date}</small></span><StatusBadge status={r.status}/></button>)}</div>
     <div className="intake-actions"><button className="btn secondary" onClick={()=>setStep(1)}><ArrowLeft size={16}/> Back</button><button className="btn primary" onClick={()=>setStep(3)}>Continue to symptoms <ArrowRight size={16}/></button></div>
   </div>}
-  {step===3 && <div className="intake-card card"><h2>What brings you to the doctor?</h2><p>Describe the main concern in your own words.</p><label className="textarea-label">Main symptoms<textarea defaultValue="Feeling very tired for the last few weeks, and both ankles become swollen by evening."/></label><div className="form-grid"><Field label="When did it start?" value="About 3 weeks ago"/><Field label="Is it getting worse?" value="Gradually getting worse"/></div><label className="textarea-label">Anything else your doctor should know?<textarea placeholder="For example: a medicine you stopped, an allergy, or a previous treatment..."/></label><div className="intake-actions"><button className="btn secondary" onClick={()=>setStep(2)}>Back</button><button className="btn primary" onClick={()=>setStep(4)}>Review information <ArrowRight size={16}/></button></div></div>}
+  {step===3 && <div className="intake-card card"><h2>What brings you to the doctor? <span className="demo-pill">Demo — not saved yet</span></h2><p>Describe the main concern in your own words.</p><label className="textarea-label">Main symptoms<textarea defaultValue="Feeling very tired for the last few weeks, and both ankles become swollen by evening."/></label><div className="form-grid"><Field label="When did it start?" value="About 3 weeks ago"/><Field label="Is it getting worse?" value="Gradually getting worse"/></div><label className="textarea-label">Anything else your doctor should know?<textarea placeholder="For example: a medicine you stopped, an allergy, or a previous treatment..."/></label><div className="intake-actions"><button className="btn secondary" onClick={()=>setStep(2)}>Back</button><button className="btn primary" onClick={()=>setStep(4)}>Review information <ArrowRight size={16}/></button></div></div>}
   {step===4 && <div className="intake-card card review-card"><div className="success-icon"><Check size={25}/></div><h2>You’re ready for your appointment</h2><p>Your information will be organised for your doctor. They will verify it with you before making any clinical decisions.</p><div className="review-summary"><div><CircleUserRound size={20}/><span><strong>Personal details</strong><small>Complete</small></span><CheckCircle2 size={18}/></div><div><FileText size={20}/><span><strong>Medical records</strong><small>{records.length} files added</small></span><CheckCircle2 size={18}/></div><div><MessageSquareText size={20}/><span><strong>Current symptoms</strong><small>Added</small></span><CheckCircle2 size={18}/></div></div><button className="btn primary full" onClick={()=>notify('Check-in submitted to Dr. Rhea Menon')}>Submit check-in</button><button className="text-center" onClick={()=>setStep(2)}>Edit my information</button></div>}
   <p className="patient-disclaimer"><ShieldCheck size={15}/> DocPilot organises your information for your clinician. It does not diagnose or replace medical advice.</p>
 </div>}
@@ -250,17 +306,132 @@ function AvatarImage({src, initials, alt, className=''}) {
 }
 
 function Timeline({compact=false}) { const data=compact?timeline.slice(0,3):timeline; return <div className={`timeline ${compact?'compact':''}`}>{data.map((x,i)=><div className="timeline-item" key={i}><span className={`timeline-dot ${x.tone}`}/><div className="timeline-date">{x.date}</div><div><span className={`tag ${x.tone}`}>{x.tag}</span><h4>{x.title}</h4><p>{x.body}</p></div></div>)}</div> }
-function Records({records,search,setSearch,onUpload}) { return <div className="records-page card"><div className="records-tools"><div><h2>All medical records</h2><p>Documents and images provided for this patient.</p></div><button className="btn primary" onClick={onUpload}><UploadCloud size={16}/> Add records</button></div><div className="search"><Search size={17}/><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search records..."/></div><div className="records-table">{records.map(r=><div key={r.id}><span className={`file-icon ${r.tone}`}><r.icon size={19}/></span><span><strong>{r.name}</strong><small>{r.type}</small></span><span>{r.date}</span><em className={r.status==='analysed'?'verified':'unverified'}>{r.status==='analysed'?'Analysed':'Needs review'}</em><button><MoreHorizontal size={18}/></button></div>)}</div></div> }
-function Gaps({notify}) { return <div className="gaps-page"><div className="card gap-hero"><span><AlertCircle size={22}/></span><div><h2>Missing information can change the clinical picture</h2><p>These gaps were identified from previous plans and the patient’s current account. Confirm with the patient before relying on them.</p></div></div>{[{title:'Latest ECG report',meta:'Recommended in cardiology note · 12 Aug 2026',why:'May help assess reported fatigue and ankle swelling.',level:'High priority'},{title:'Repeat renal function panel',meta:'Due around 09 Sep 2026 · No result found',why:'Required after medication adjustment and reduced eGFR.',level:'Follow-up overdue'}].map(g=><div className="card gap-row" key={g.title}><span className="gap-icon"><FileText size={21}/></span><div><em>{g.level}</em><h3>{g.title}</h3><p>{g.meta}</p><small><strong>Why it matters:</strong> {g.why}</small></div><button className="btn secondary" onClick={()=>notify(`Request prepared: ${g.title}`)}>Request record</button></div>)}</div> }
+function Records({records,search,setSearch,onUpload,onOpenRecord}) { return <div className="records-page card"><div className="records-tools"><div><h2>All medical records</h2><p>Documents and images provided for this patient.</p></div><button className="btn primary" onClick={onUpload}><UploadCloud size={16}/> Add records</button></div><div className="search"><Search size={17}/><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search records..."/></div><div className="records-table">{records.length === 0 && <p className="records-empty">No records yet. Upload a document to start OCR processing.</p>}{records.map(r=><button type="button" className="record-row" key={r.id} onClick={()=>!String(r.id).startsWith('local-') && onOpenRecord(r)}><span className={`file-icon ${r.tone}`}><r.icon size={19}/></span><span><strong>{r.name}</strong><small>{r.type}</small></span><span>{r.date}</span><StatusBadge status={r.status}/><MoreHorizontal size={18}/></button>)}</div></div> }
+function Gaps({notify}) { return <div className="gaps-page"><div className="card gap-hero"><span><AlertCircle size={22}/></span><div><h2>Missing information can change the clinical picture <span className="demo-pill">Demo data</span></h2><p>These gaps were identified from previous plans and the patient’s current account. Confirm with the patient before relying on them.</p></div></div>{[{title:'Latest ECG report',meta:'Recommended in cardiology note · 12 Aug 2026',why:'May help assess reported fatigue and ankle swelling.',level:'High priority'},{title:'Repeat renal function panel',meta:'Due around 09 Sep 2026 · No result found',why:'Required after medication adjustment and reduced eGFR.',level:'Follow-up overdue'}].map(g=><div className="card gap-row" key={g.title}><span className="gap-icon"><FileText size={21}/></span><div><em>{g.level}</em><h3>{g.title}</h3><p>{g.meta}</p><small><strong>Why it matters:</strong> {g.why}</small></div><button className="btn secondary" onClick={()=>notify(`Request prepared: ${g.title}`)}>Request record</button></div>)}</div> }
+
+function OcrReview({ record, role, reviewerName, onClose, onChanged, notify }) {
+  const [ocr, setOcr] = useState(null);
+  const [fileUrl, setFileUrl] = useState(null);
+  const [loadError, setLoadError] = useState('');
+  const [text, setText] = useState('');
+  const [page, setPage] = useState(0);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    setOcr(null); setLoadError(''); setPage(0);
+    if (record.status === 'ready' || record.status === 'needs_review') {
+      api.getOcr(record.id)
+        .then((data) => { if (active) { setOcr(data); setText(data.corrected_text ?? data.raw_text); } })
+        .catch((e) => active && setLoadError(e.message));
+    }
+    if (!fileUrl) {
+      api.getRecordFileUrl(record.id, role)
+        .then((url) => active && setFileUrl(url))
+        .catch(() => {});
+    }
+    return () => { active = false; };
+  }, [record.id, record.status]);
+
+  const save = async (approve) => {
+    setSaving(true);
+    try {
+      const updated = await api.saveOcrCorrection(record.id, { corrected_text: text, reviewer: reviewerName, approve }, role);
+      setOcr(updated);
+      notify(approve ? 'Transcription approved' : 'Correction saved');
+      onChanged();
+    } catch (e) { notify(`Save failed: ${e.message}`); }
+    finally { setSaving(false); }
+  };
+
+  const retry = async () => {
+    if (!record.jobId) return;
+    try {
+      await api.retryJob(record.jobId, role);
+      notify('Processing restarted');
+      onChanged();
+      onClose();
+    } catch (e) { notify(`Retry failed: ${e.message}`); }
+  };
+
+  const pages = ocr?.result_json?.pages || [];
+  const current = pages[page];
+  const isImage = record.contentType?.startsWith('image/');
+
+  return <div className="detail-backdrop" onClick={onClose}>
+    <aside className="detail-drawer ocr-drawer" onClick={e => e.stopPropagation()}>
+      <button className="drawer-close" onClick={onClose}><X size={20}/></button>
+      <div className="ocr-head">
+        <div><h2>{record.name}</h2><p>{record.type} · {record.date}</p></div>
+        <StatusBadge status={record.status}/>
+      </div>
+
+      {record.status === 'failed' && (
+        <div className="ocr-banner failed"><AlertCircle size={17}/><div><strong>We couldn't process this document</strong><span>{ERROR_MESSAGES[record.jobErrorCode] || 'The file could not be processed.'} You can try again.</span>
+          {role === 'doctor' && record.jobError && <details className="tech-detail"><summary>Technical detail ({record.jobErrorCode || 'unknown'})</summary><code>{record.jobError}</code></details>}
+        </div><button className="btn secondary" onClick={retry}><RefreshCw size={15}/> Retry</button></div>
+      )}
+      {(record.status === 'processing' || record.status === 'uploaded') && (
+        <div className="ocr-banner"><Clock3 size={17}/><div><strong>Processing document</strong><span>OCR is running. This page updates automatically when it finishes.</span></div></div>
+      )}
+      {record.status === 'needs_review' && (
+        <div className="ocr-banner review"><AlertCircle size={17}/><div><strong>Some text could not be read confidently</strong><span>Compare the highlighted lines against the original document and correct them if needed.</span></div></div>
+      )}
+
+      <div className="ocr-grid">
+        <div className="ocr-doc">
+          <span className="ocr-pane-title">Original document</span>
+          {fileUrl ? (isImage
+            ? <img src={fileUrl} alt="Original document"/>
+            : <iframe src={fileUrl} title="Original document"/>)
+            : <p className="ocr-muted">Original file unavailable.</p>}
+        </div>
+        <div className="ocr-text">
+          <span className="ocr-pane-title">OCR transcription {ocr && <small>engine: {ocr.engine} · {ocr.page_count} page{ocr.page_count === 1 ? '' : 's'}{ocr.mean_confidence != null && ` · mean confidence ${Math.round(ocr.mean_confidence * 100)}%`}</small>}</span>
+          {ocr?.review_status === 'approved' && <span className="review-chip approved"><CheckCircle2 size={14}/> Approved by {ocr.reviewed_by}</span>}
+          {ocr?.review_status === 'corrected' && <span className="review-chip"><CheckCircle2 size={14}/> Corrected by {ocr.reviewed_by}</span>}
+          {loadError && <p className="ocr-muted">{loadError}</p>}
+          {ocr && <>
+            {pages.length > 1 && <div className="ocr-pages">{pages.map((p, i) => <button key={p.page_number} className={i === page ? 'active' : ''} onClick={() => setPage(i)}>Page {p.page_number}{p.status === 'failed' ? ' ⚠' : ''}</button>)}</div>}
+            {current?.status === 'failed'
+              ? <p className="ocr-muted">This page could not be processed{current.error ? `: ${current.error}` : '.'} Other pages are unaffected.</p>
+              : <div className="ocr-lines">{current?.lines.map(l => (
+                  <div key={l.line_id} className={`ocr-line ${l.needs_review ? 'uncertain' : ''}`}>
+                    <span>{l.text}</span>
+                    <em>{l.confidence != null ? `${Math.round(l.confidence * 100)}%` : 'no score'}{l.needs_review && ' · check'}</em>
+                  </div>))}
+                {current && current.lines.length === 0 && <p className="ocr-muted">No text found on this page.</p>}
+              </div>}
+            <label className="textarea-label ocr-editor">Corrected transcription (human-edited)
+              <textarea value={text} onChange={e => setText(e.target.value)} rows={7}/>
+            </label>
+            {ocr.corrected_text != null && ocr.corrected_text !== ocr.raw_text && (
+              <details className="tech-detail raw-ocr"><summary>Original OCR engine output (preserved, unedited)</summary><pre>{ocr.raw_text}</pre></details>
+            )}
+            <p className="ocr-note">Corrections are stored alongside the original OCR output — the raw engine result is never overwritten. OCR confidence is not clinical certainty; verify against the original document.</p>
+            <div className="ocr-actions">
+              <button className="btn secondary" disabled={saving} onClick={() => save(false)}>Save correction</button>
+              {role === 'doctor' && <button className="btn primary" disabled={saving} onClick={() => save(true)}><Check size={16}/> Approve transcription</button>}
+            </div>
+          </>}
+        </div>
+      </div>
+    </aside>
+  </div>;
+}
 
 function toUiRecord(record) {
   const image = record.content_type?.startsWith('image/');
   return {
     id: record.id,
+    jobId: record.latest_job?.id || null,
+    jobError: record.latest_job?.error || null,
+    jobErrorCode: record.latest_job?.error_code || null,
+    contentType: record.content_type,
     name: record.filename,
     date: record.captured_at || new Date(record.uploaded_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }),
     type: record.source_type.replaceAll('_', ' '),
-    status: record.status === 'ready' ? 'analysed' : 'review',
+    status: record.status,
     icon: image ? FileImage : FileText,
     tone: image ? 'orange' : 'blue',
   };

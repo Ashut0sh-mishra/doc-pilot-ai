@@ -39,3 +39,56 @@
 @media(max-width:780px){.topbar{left:0}}
 @media(max-width:780px){.doctor-sticky-context{position:relative;top:auto;z-index:1;padding-top:0;box-shadow:none}}
 .doctor-cockpit{max-width:none;width:100%}
+
+/* --- OCR pipeline: status badges, review drawer, demo labels --- */
+.status-badge{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;padding:4px 10px;border-radius:20px;white-space:nowrap}
+.status-badge.st-ready{background:#e3f2ea;color:#146c5b}
+.status-badge.st-review{background:#fdf0e2;color:#a5551f}
+.status-badge.st-failed{background:#fbe7e5;color:#a93d38}
+.status-badge.st-active{background:#e8eef7;color:#2c5d8f}
+.status-badge.st-local{background:#eef0ee;color:#6f7d7a}
+.demo-pill{display:inline-block;font-size:9px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:#6f7d7a;background:#eef0ee;border:1px solid #dde4e0;border-radius:20px;padding:2px 8px;vertical-align:middle;margin-left:6px}
+.record-row,.upload-row{display:flex;align-items:center;gap:12px;width:100%;border:0;background:transparent;text-align:left;padding:12px 8px;border-bottom:1px solid var(--line);font:inherit;color:inherit}
+.record-row:hover,.upload-row:hover{background:#f7faf8}
+.record-row>span:nth-child(2),.upload-row>span:nth-child(2){flex:1}
+.record-row strong,.upload-row strong{display:block;font-size:13px}
+.record-row small,.upload-row small{color:var(--muted);font-size:11px}
+.records-empty{color:var(--muted);font-size:13px;padding:18px 8px}
+.ocr-drawer{width:min(1060px,96vw)}
+.ocr-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin:14px 40px 16px 0}
+.ocr-head h2{font:700 21px Manrope;margin:0 0 4px;color:#192b28}
+.ocr-head p{margin:0;color:var(--muted);font-size:12px;text-transform:capitalize}
+.ocr-banner{display:flex;align-items:center;gap:10px;border:1px solid #dfe8e2;background:#f4f8f5;border-radius:11px;padding:12px 14px;margin-bottom:16px;font-size:12px}
+.ocr-banner strong{display:block;font-size:13px}
+.ocr-banner span{color:var(--muted)}
+.ocr-banner.failed{border-color:#eccfcb;background:#fdf4f3;color:#8f3733}
+.ocr-banner.failed span{color:#a9605c}
+.ocr-banner.review{border-color:#f2ddc0;background:#fdf8ee}
+.ocr-banner .btn{margin-left:auto;flex-shrink:0}
+.ocr-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+@media(max-width:900px){.ocr-grid{grid-template-columns:1fr}}
+.ocr-pane-title{display:block;font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+.ocr-pane-title small{text-transform:none;letter-spacing:0;margin-left:6px}
+.ocr-doc img,.ocr-doc iframe{width:100%;min-height:380px;border:1px solid var(--line);border-radius:11px;background:#f7faf8;object-fit:contain}
+.ocr-doc iframe{height:480px}
+.ocr-muted{color:var(--muted);font-size:12px}
+.ocr-pages{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.ocr-pages button{border:1px solid var(--line);background:#fff;border-radius:8px;padding:5px 10px;font-size:11px}
+.ocr-pages button.active{background:var(--green);color:#fff;border-color:var(--green)}
+.ocr-lines{border:1px solid var(--line);border-radius:11px;max-height:300px;overflow:auto;margin-bottom:12px}
+.ocr-line{display:flex;justify-content:space-between;gap:12px;padding:8px 12px;font-size:12px;border-bottom:1px solid #eef2ef}
+.ocr-line:last-child{border-bottom:0}
+.ocr-line em{font-style:normal;color:var(--muted);font-size:10px;white-space:nowrap}
+.ocr-line.uncertain{background:#fdf6e8}
+.ocr-line.uncertain em{color:#a5551f;font-weight:700}
+.ocr-editor textarea{width:100%;border:1px solid var(--line);border-radius:9px;padding:10px;font-size:12px;line-height:1.5;resize:vertical}
+.ocr-note{font-size:11px;color:var(--muted);line-height:1.5;margin:8px 0 12px}
+.ocr-actions{display:flex;gap:10px;justify-content:flex-end}
+.review-chip{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;color:#146c5b;background:#e3f2ea;border-radius:20px;padding:4px 10px;margin-bottom:10px}
+.review-chip.approved{background:#d9eee8}
+
+/* --- second pass: technical detail disclosure + raw OCR evidence --- */
+.tech-detail{margin-top:8px;font-size:11px;color:var(--muted)}
+.tech-detail summary{cursor:pointer;font-weight:700}
+.tech-detail code{display:block;margin-top:6px;background:#f4f6f5;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:11px;word-break:break-word;color:#8f3733}
+.raw-ocr pre{white-space:pre-wrap;background:#fbf9f2;border:1px solid #eadfc6;border-radius:9px;padding:10px 12px;font-size:12px;line-height:1.55;max-height:220px;overflow:auto;color:#5d5644}

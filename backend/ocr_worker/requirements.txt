@@ -1,3 +1,8 @@
-# OCR runs in Python 3.12 separately from the FastAPI Python 3.14 environment.
+# OCR engine dependencies. The API runs fine without these; the worker
+# needs them when OCR_ENGINE=paddle (the default). PyMuPDF and Pillow are
+# already in ../requirements.txt and are repeated here so a standalone
+# worker environment is self-contained.
 paddleocr==3.7.0
 paddlepaddle==3.2.0
+pymupdf==1.28.2
+pillow==12.1.0
