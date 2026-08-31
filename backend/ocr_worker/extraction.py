@@ -37,7 +37,8 @@ MAX_INPUT_CHARS = 12_000
 
 def extract_clinical_structure(raw_text: str, settings, poster=None) -> dict | None:
     """Return unverified structured extraction, or None on any failure."""
-    if not settings.groq_api_key:
+    keys = settings.groq_key_list()
+    if not keys:
         return None
     import httpx
 
@@ -52,7 +53,7 @@ def extract_clinical_structure(raw_text: str, settings, poster=None) -> dict | N
         ],
     }
     url = f"{settings.groq_base_url}/chat/completions"
-    headers = {"Authorization": f"Bearer {settings.groq_api_key}"}
+    headers = {"Authorization": f"Bearer {keys[0]}"}
     try:
         resp = (poster or httpx.post)(url, headers=headers, json=payload, timeout=settings.groq_timeout_seconds)
         if getattr(resp, "status_code", 200) >= 400:

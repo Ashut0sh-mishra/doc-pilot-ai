@@ -1,2 +1,17 @@
 /dist
 /node_modules
+
+# secrets & local environment
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+backend/.venv/
+
+# local dev data
+backend/*.db
+backend/*.db.bak
+backend/uploads/
