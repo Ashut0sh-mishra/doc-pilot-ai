@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -48,12 +49,13 @@ class GroqVisionEngine:
         self.settings = settings or get_settings()
         self.model = self.settings.groq_vision_model
         self._poster = poster  # test seam: callable(url, headers, json, timeout) -> response-like
+        self._key_index = 0
 
     def warmup(self) -> None:
-        if not self.settings.groq_api_key:
+        if not self.settings.groq_key_list():
             raise OcrError(
                 "model_init_failure",
-                "OCR_ENGINE=groq but GROQ_API_KEY is not set; refusing to process documents",
+                "OCR_ENGINE=groq but GROQ_API_KEY(S) is not set; refusing to process documents",
                 retryable=False,
             )
 
@@ -63,25 +65,33 @@ class GroqVisionEngine:
         import httpx
 
         url = f"{self.settings.groq_base_url}/chat/completions"
-        headers = {"Authorization": f"Bearer {self.settings.groq_api_key}"}
+        keys = self.settings.groq_key_list()
         poster = self._poster or httpx.post
-        waits = 0
+        attempts = 0
+        max_attempts = self.settings.groq_429_max_waits + len(keys)
+        key_index = self._key_index
         while True:
+            key = keys[key_index % len(keys)]
             try:
-                resp = poster(url, headers=headers, json=payload, timeout=self.settings.groq_timeout_seconds)
+                resp = poster(url, headers={"Authorization": f"Bearer {key}"}, json=payload, timeout=self.settings.groq_timeout_seconds)
             except Exception as exc:
                 raise OcrError("transient", f"Groq request failed: {type(exc).__name__}", retryable=True) from exc
             status = getattr(resp, "status_code", 200)
-            if status == 429 and waits < self.settings.groq_429_max_waits:
-                waits += 1
-                retry_after = float(getattr(resp, "headers", {}).get("retry-after", 2))
-                logger.info("groq_rate_limited wait_s=%.0f attempt=%d", retry_after, waits)
-                time.sleep(min(retry_after, 60))
+            if status == 429 and attempts < max_attempts:
+                attempts += 1
+                key_index += 1  # rotate to the next key in the pool
+                if attempts > len(keys):  # whole pool is limited: honour retry-after
+                    retry_after = float(getattr(resp, "headers", {}).get("retry-after", 2))
+                    logger.info("groq_rate_limited wait_s=%.0f attempt=%d", retry_after, attempts)
+                    time.sleep(min(retry_after, 60))
+                else:
+                    logger.info("groq_key_rotated attempt=%d", attempts)
                 continue
             if status == 429:
-                raise OcrError("transient", "Groq rate limit persisted", retryable=True)
+                raise OcrError("transient", "Groq rate limit persisted across the key pool", retryable=True)
             if status >= 400:
                 raise OcrError("ocr_failure", f"Groq API returned HTTP {status}", retryable=status >= 500)
+            self._key_index = key_index  # sticky: resume from the key that worked
             return resp.json()
 
     # --- transcription -----------------------------------------------------
@@ -90,6 +100,8 @@ class GroqVisionEngine:
         self.warmup()
         image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
         text = self._transcribe(image_b64, page_number, self.settings.groq_max_tokens)
+        # belt and suspenders: some models still emit <think> blocks
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
         lines = [
             EngineLine(
                 text=line,
@@ -105,6 +117,7 @@ class GroqVisionEngine:
         payload = {
             "model": self.model,
             "temperature": 0,
+            "reasoning_effort": "none",  # pure transcription, no thinking
             "max_completion_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": OCR_SYSTEM},

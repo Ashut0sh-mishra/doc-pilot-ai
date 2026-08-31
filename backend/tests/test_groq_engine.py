@@ -18,7 +18,8 @@ from tests.test_worker import get_job, get_record, make_patient, png_bytes, run_
 
 
 def groq_settings(**overrides):
-    return Settings(groq_api_key="test-key-not-real", **overrides)
+    # keep the real backend/.env keys out of tests: explicit None wins over env
+    return Settings(groq_api_key="test-key-not-real", groq_api_keys=None, **overrides)
 
 
 class FakeGroq:
@@ -43,7 +44,7 @@ def chat(text, finish="stop"):
 
 
 def test_engine_requires_api_key():
-    engine = GroqVisionEngine(settings=Settings(groq_api_key=None))
+    engine = GroqVisionEngine(settings=Settings(groq_api_key=None, groq_api_keys=None))
     try:
         engine.warmup()
         raise AssertionError("should have raised")
@@ -160,5 +161,47 @@ def test_extraction_failure_does_not_fail_job(client):
     assert "extraction" not in ocr["result_json"]
 
 
+def test_key_pool_rotates_on_rate_limit(monkeypatch):
+    import ocr_worker.engines.groq_vision as gv
+    monkeypatch.setattr(gv.time, "sleep", lambda s: None)
+
+    seen_keys = []
+
+    def poster(url, headers, json, timeout):
+        seen_keys.append(headers["Authorization"])
+        if len(seen_keys) == 1:
+            return SimpleNamespace(status_code=429, headers={"retry-after": "30"}, json=lambda: {})
+        return SimpleNamespace(status_code=200, headers={}, json=lambda: chat("rotated ok"))
+
+    settings = Settings(groq_api_keys="key-a,key-b")
+    engine = GroqVisionEngine(settings=settings, poster=poster)
+    import tempfile
+    from pathlib import Path
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp.write(png_bytes())
+        tmp_path = Path(tmp.name)
+    page = engine.ocr_image(tmp_path, 1)
+    tmp_path.unlink()
+
+    assert seen_keys == ["Bearer key-a", "Bearer key-b"]  # rotated, no 30s wait
+    assert page.lines[0].text == "rotated ok"
+    assert engine._key_index == 1  # sticky on the working key
+
+
+def test_think_blocks_are_stripped_and_reasoning_disabled():
+    poster = FakeGroq([chat("<think>let me read this carefully...</think>\nTab. Metformin 500 mg")])
+    engine = GroqVisionEngine(settings=groq_settings(), poster=poster)
+    import tempfile
+    from pathlib import Path
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp.write(png_bytes())
+        tmp_path = Path(tmp.name)
+    page = engine.ocr_image(tmp_path, 1)
+    tmp_path.unlink()
+
+    assert [l.text for l in page.lines] == ["Tab. Metformin 500 mg"]
+    assert poster.payloads[0]["reasoning_effort"] == "none"
+
+
 def test_extraction_returns_none_without_key():
-    assert extract_clinical_structure("text", Settings(groq_api_key=None, groq_extraction_enabled=True)) is None
+    assert extract_clinical_structure("text", Settings(groq_api_key=None, groq_api_keys=None, groq_extraction_enabled=True)) is None
