@@ -186,6 +186,17 @@ class Worker:
 
     def _store_result(self, db, job: ProcessingJob, record: MedicalRecord, pages: list[EnginePage], started: float) -> None:
         normalized = assemble_result(record.id, self.engine.name, self.engine.model, pages)
+        # Optional LLM structuring pass — separate from OCR, unverified,
+        # and never allowed to fail or alter the transcription.
+        if self.settings.groq_extraction_enabled and normalized["full_text"]:
+            from ocr_worker.extraction import extract_clinical_structure
+
+            extraction = extract_clinical_structure(
+                normalized["full_text"], self.settings, poster=getattr(self.engine, "_poster", None)
+            )
+            if extraction:
+                normalized["extraction"] = extraction
+                logger.info("extraction_completed job_id=%s record_id=%s", job.id, record.id)
         stored = db.scalar(select(OcrResult).where(OcrResult.record_id == record.id)) or OcrResult(record_id=record.id, result_json={})
         stored.schema_version = normalized["schema_version"]
         stored.engine = self.engine.name

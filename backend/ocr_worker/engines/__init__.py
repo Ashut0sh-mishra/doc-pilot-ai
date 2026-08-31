@@ -16,4 +16,8 @@ def get_engine(name: str) -> OcrEngine:
         from .pdftext import PdfTextEngine
 
         return PdfTextEngine()
+    if name == "groq":
+        from .groq_vision import GroqVisionEngine
+
+        return GroqVisionEngine()
     raise OcrError("model_init_failure", f"Unknown OCR engine: {name!r}", retryable=False)
