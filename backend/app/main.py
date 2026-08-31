@@ -1,10 +1,13 @@
+import logging
 import re
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -13,9 +16,11 @@ from .config import get_settings
 from .database import Base, engine, get_db
 from .models import MedicalRecord, Medication, OcrResult, Patient, ProcessingJob, RecordStatus
 from .schemas import (
-    JobRead, MedicationCreate, MedicationRead, OcrResultRead, PatientCreate, PatientRead,
-    RecordRead, RecordUploadRequest, RecordUploadResponse, SummaryRead,
+    JobRead, MedicationCreate, MedicationRead, OcrCorrectionRequest, OcrResultRead, PatientCreate,
+    PatientRead, RecordRead, RecordUploadRequest, RecordUploadResponse, SummaryRead,
 )
+
+logger = logging.getLogger("docpilot.api")
 
 
 @asynccontextmanager
@@ -28,7 +33,12 @@ settings = get_settings()
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,6 +50,23 @@ def patient_or_404(patient_id: str, db: Session) -> Patient:
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
     return patient
+
+
+def record_or_404(record_id: str, db: Session) -> MedicalRecord:
+    record = db.get(MedicalRecord, record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return record
+
+
+def stored_file_path(record: MedicalRecord) -> Path:
+    """Resolve the upload path from the record; the filename is sanitised at
+    upload time so this cannot escape the upload directory."""
+    upload_root = Path(settings.upload_dir).resolve()
+    path = (upload_root / f"{record.id}-{Path(record.filename).name}").resolve()
+    if upload_root not in path.parents:
+        raise HTTPException(status_code=400, detail="Invalid storage path")
+    return path
 
 
 @app.get("/health")
@@ -80,6 +107,20 @@ def list_medications(patient_id: str, db: Session = Depends(get_db), _: str = De
 @app.post("/v1/patients/{patient_id}/records/upload", response_model=RecordUploadResponse, status_code=201)
 def initiate_upload(patient_id: str, payload: RecordUploadRequest, db: Session = Depends(get_db), _: str = Depends(require_role("patient", "doctor"))):
     patient_or_404(patient_id, db)
+    suffix = Path(payload.filename).suffix.lower()
+    if suffix not in settings.allowed_extension_set():
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type '{suffix or '(none)'}'. Supported: {', '.join(sorted(settings.allowed_extension_set()))}",
+        )
+    declared = payload.content_type.lower()
+    if declared not in settings.allowed_content_type_set():
+        raise HTTPException(status_code=415, detail=f"Unsupported content type '{payload.content_type}'")
+    if suffix == ".pdf" and declared != "application/pdf":
+        raise HTTPException(status_code=415, detail="File extension and content type do not match")
+    if suffix != ".pdf" and not declared.startswith("image/"):
+        raise HTTPException(status_code=415, detail="File extension and content type do not match")
+
     safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", payload.filename)
     storage_key = f"patients/{patient_id}/records/{uuid.uuid4()}-{safe_name}"
     record = MedicalRecord(patient_id=patient_id, storage_key=storage_key, **payload.model_dump())
@@ -96,34 +137,53 @@ async def dev_upload(record_id: str, request: Request, db: Session = Depends(get
     """Receive file bytes locally. Production will use a presigned object-storage URL."""
     if settings.app_env != "development":
         raise HTTPException(status_code=404, detail="Not found")
-    record = db.get(MedicalRecord, record_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Record not found")
+    record = record_or_404(record_id, db)
     body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty upload")
     if len(body) > settings.max_upload_mb * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"File exceeds {settings.max_upload_mb} MB limit")
-    upload_root = Path(settings.upload_dir).resolve()
-    upload_root.mkdir(parents=True, exist_ok=True)
-    (upload_root / f"{record.id}-{Path(record.filename).name}").write_bytes(body)
+    path = stored_file_path(record)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
 
 
 @app.post("/v1/records/{record_id}/complete", response_model=JobRead, status_code=202)
 def complete_upload(record_id: str, db: Session = Depends(get_db), _: str = Depends(require_role("patient", "doctor"))):
-    record = db.get(MedicalRecord, record_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Record not found")
+    record = record_or_404(record_id, db)
+    if not stored_file_path(record).exists():
+        raise HTTPException(status_code=409, detail="File bytes have not been uploaded yet")
+    # Idempotent: an active job for this record is returned instead of duplicating.
+    active = db.scalar(
+        select(ProcessingJob).where(
+            ProcessingJob.record_id == record_id,
+            ProcessingJob.status.in_(("queued", "processing")),
+        ).order_by(ProcessingJob.created_at.desc())
+    )
+    if active:
+        return active
     record.status = RecordStatus.processing
     job = ProcessingJob(record_id=record_id)
     db.add(job)
     db.commit()
     db.refresh(job)
+    logger.info("job_created job_id=%s record_id=%s", job.id, record_id)
     return job
 
 
 @app.get("/v1/patients/{patient_id}/records", response_model=list[RecordRead])
 def list_records(patient_id: str, db: Session = Depends(get_db), _: str = Depends(require_role("patient", "doctor"))):
     patient_or_404(patient_id, db)
-    return db.scalars(select(MedicalRecord).where(MedicalRecord.patient_id == patient_id).order_by(MedicalRecord.uploaded_at.desc())).all()
+    records = db.scalars(select(MedicalRecord).where(MedicalRecord.patient_id == patient_id).order_by(MedicalRecord.uploaded_at.desc())).all()
+    out = []
+    for record in records:
+        job = db.scalar(
+            select(ProcessingJob).where(ProcessingJob.record_id == record.id).order_by(ProcessingJob.created_at.desc())
+        )
+        row = RecordRead.model_validate(record)
+        row.latest_job = JobRead.model_validate(job) if job else None
+        out.append(row)
+    return out
 
 
 @app.get("/v1/jobs/{job_id}", response_model=JobRead)
@@ -136,10 +196,66 @@ def get_job(job_id: str, db: Session = Depends(get_db), _: str = Depends(require
 
 @app.get("/v1/records/{record_id}/ocr", response_model=OcrResultRead)
 def get_ocr_result(record_id: str, db: Session = Depends(get_db), _: str = Depends(require_role("patient", "doctor"))):
+    record_or_404(record_id, db)
     result = db.scalar(select(OcrResult).where(OcrResult.record_id == record_id))
     if not result:
         raise HTTPException(status_code=404, detail="OCR result is not ready")
     return result
+
+
+@app.put("/v1/records/{record_id}/ocr", response_model=OcrResultRead)
+def correct_ocr_result(record_id: str, payload: OcrCorrectionRequest, db: Session = Depends(get_db), role: str = Depends(require_role("patient", "doctor"))):
+    """Store a human correction next to the raw OCR output (never overwrites
+    raw_text). Approving a transcription is a doctor-only action."""
+    record_or_404(record_id, db)
+    result = db.scalar(select(OcrResult).where(OcrResult.record_id == record_id))
+    if not result:
+        raise HTTPException(status_code=404, detail="OCR result is not ready")
+    if payload.approve and role != "doctor":
+        raise HTTPException(status_code=403, detail="Only a doctor can approve a transcription")
+    result.corrected_text = payload.corrected_text
+    result.reviewed_by = payload.reviewer
+    result.reviewed_at = datetime.now(timezone.utc)
+    result.review_status = "approved" if payload.approve else "corrected"
+    db.commit()
+    db.refresh(result)
+    logger.info("ocr_reviewed record_id=%s reviewer=%s approved=%s", record_id, payload.reviewer, payload.approve)
+    return result
+
+
+@app.get("/v1/records/{record_id}/file")
+def get_record_file(record_id: str, db: Session = Depends(get_db), _: str = Depends(require_role("patient", "doctor"))):
+    """Serve the original uploaded document for side-by-side review."""
+    record = record_or_404(record_id, db)
+    path = stored_file_path(record)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File bytes are not available")
+    return FileResponse(path, media_type=record.content_type, filename=record.filename, content_disposition_type="inline")
+
+
+@app.post("/v1/jobs/{job_id}/retry", response_model=JobRead, status_code=202)
+def retry_job(job_id: str, db: Session = Depends(get_db), _: str = Depends(require_role("patient", "doctor"))):
+    """Requeue a failed OCR job. Permanently invalid documents will fail
+    again at validation without consuming worker time on repeats."""
+    job = db.get(ProcessingJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "failed":
+        raise HTTPException(status_code=409, detail=f"Only failed jobs can be retried (current: {job.status})")
+    record = record_or_404(job.record_id, db)
+    job.status = "queued"
+    job.error = None
+    job.error_code = None
+    job.attempt_count = 0
+    job.started_at = None
+    job.heartbeat_at = None
+    job.lease_expires_at = None
+    job.completed_at = None
+    record.status = RecordStatus.processing
+    db.commit()
+    db.refresh(job)
+    logger.info("job_retry_requested job_id=%s record_id=%s", job.id, job.record_id)
+    return job
 
 
 @app.get("/v1/patients/{patient_id}/clinical-summary", response_model=SummaryRead)
