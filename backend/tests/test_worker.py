@@ -65,12 +65,6 @@ def pdf_bytes(texts=("Metformin 500 mg twice daily", "Review in 4 weeks")):
     return data
 
 
-@pytest.fixture()
-def client():
-    with TestClient(app) as c:
-        yield c
-
-
 def make_patient(client):
     resp = client.post("/v1/patients", headers=HEADERS, json={
         "full_name": "Audit Patient", "date_of_birth": "1970-01-01", "sex": "female",

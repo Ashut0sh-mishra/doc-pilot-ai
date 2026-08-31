@@ -43,8 +43,20 @@ upload -> validate -> PDF pages rasterised one at a time / image normalised
 
 The engine is selected with `OCR_ENGINE` and is fully replaceable:
 
-- `paddle` (default) — PaddleOCR PP-OCRv5 for scanned PDFs and photos, incl. handwriting. Heavy; install `ocr_worker/requirements.txt`.
+- `paddle` (default) — PaddleOCR PP-OCRv5 for scanned PDFs and photos, incl. handwriting. Runs locally; heavy; install `ocr_worker/requirements.txt`.
 - `pdftext` — PyMuPDF embedded-text extraction for digital PDFs only. Light, deterministic; reports `confidence: null` honestly instead of inventing scores. Scans/photos need `paddle`.
+- `groq` (OPT-IN, external) — vision-LLM transcription: each prepared page image goes to Groq's multimodal chat API with a strict contract (one line per written line, temperature 0, `[illegible]` instead of guessing). The model returns no confidence/boxes — confidence is reported as `null`, `[illegible]` lines are flagged for review.
+
+> **Privacy:** `groq` sends page images (and, if enabled, OCR text) to an
+> external API. It is OFF unless `OCR_ENGINE=groq` and `GROQ_API_KEY` is set.
+> Do not enable for real patient data without a DPA/BAA and consent. The key
+> is read from the environment only and is never logged.
+
+Optional reasoning pass: with `GROQ_EXTRACTION_ENABLED=true`, the worker sends
+the finished transcription to a text model and stores an **unverified**
+structured summary (medications/measurements/dates) under
+`result_json.extraction`. It never modifies the OCR text, never decides
+clinical truth, and its failure never fails the OCR job.
 
 Job reliability: atomic claiming (two workers cannot take the same job), a lease + per-page heartbeat (a crashed worker's job is requeued, or failed after `OCR_MAX_RETRIES`), error classification (`invalid_input`, `unsupported_format`, `corrupt_document`, `too_large`, `model_init_failure`, `ocr_failure`, `timeout`, `transient`), and page-level fault isolation — one bad page never discards the rest. A failed job always moves its record to `failed`.
 
